@@ -48,7 +48,7 @@
 #define QAP_DEFAULT_PASSTHROUGH_HANDLE 1003
 
 #define COMPRESS_OFFLOAD_PLAYBACK_LATENCY 300
-#define MS12_LATENCY 310
+#define MS12_LATENCY 12960 //frames for 270ms
 
 #define MIN_PCM_OFFLOAD_FRAGMENT_SIZE 512
 #define MAX_PCM_OFFLOAD_FRAGMENT_SIZE (240 * 1024)
@@ -98,6 +98,9 @@
 
 //TODO: Need to handle for DTS
 #define QAP_DEEP_BUFFER_OUTPUT_PERIOD_SIZE 1536
+
+#define MS12_ATMOS_LOCK_MASK  2
+#define MS12_CHMOD_LOCK_MASK  3
 
 #include <stdlib.h>
 #include <pthread.h>
@@ -201,7 +204,8 @@ struct qap_module {
     pthread_cond_t session_output_cond;
     pthread_mutex_t session_output_lock;
     pthread_cond_t drain_output_cond;
-
+    int  interpolation;
+    bool pause;
 };
 
 struct qap {
@@ -213,6 +217,8 @@ struct qap {
     bool hdmi_connect;
     char ms12_out_format[4];
     int hdmi_sink_channels;
+    //bit 0: atmos_lock, bit 1: chmod_lock, bit 2: request for atmos_lock, bit 3: request for chmod_
+    char ms12_lock;
 
     //Flag to indicate if QAP transcode output stream is enabled from any mm module.
     bool passthrough_enabled;
@@ -232,6 +238,7 @@ struct qap {
     struct stream_out *passthrough_out;
 
     struct qap_module qap_mod[MAX_MM_MODULE_TYPE];
+    bool wait_on_cond;
 };
 
 #define MAX_OUTPUTS  2
@@ -638,6 +645,143 @@ static float AmpToDb(float amplification)
      return db;
 }
 
+static int set_ms12_atmos_lock(int lock)
+{
+    int ret = 0;
+    int32_t cmd_data[2] = {0};
+    struct qap_module *qap_mod = &(p_qap->qap_mod[MS12]);
+
+    DEBUG_MSG_VV("%s:%d Entry", __func__, __LINE__);
+    if (p_qap) {
+       if (!p_qap->qap_mod[MS12].session_handle) {
+           p_qap->ms12_lock = p_qap->ms12_lock | lock;
+           //bit 2: save request for atmos_lock before session open
+           p_qap->ms12_lock = p_qap->ms12_lock | (1 << MS12_ATMOS_LOCK_MASK);
+           ERROR_MSG("request recieved but session is not setup, caching request");
+           return ret;
+       }
+    }
+
+    if (!(p_qap->ms12_lock & (1 << MS12_ATMOS_LOCK_MASK)))
+        pthread_mutex_lock(&p_qap->lock);
+
+    if (!p_qap->bypass_enable) {
+        cmd_data[0] = MS12_SESSION_CFG_ATMOS_LOCK;
+        cmd_data[1] = lock;
+        check_and_activate_output_thread(true);
+        if (qap_mod->session_handle != NULL) {
+            ret = qap_session_cmd(qap_mod->session_handle,
+                  QAP_SESSION_CMD_SET_PARAM,
+                  sizeof(cmd_data),
+                  &cmd_data[0],
+                  NULL,
+                  NULL);
+
+           if (ret != QAP_STATUS_OK) {
+              ERROR_MSG("atmos_lock set failed");
+           }
+        } else
+           DEBUG_MSG("qap module is not yet opened!!,atmos_lock cannot be configured");
+        check_and_activate_output_thread(false);
+    } else {
+        ERROR_MSG("in bypass mode, atmos lock can't be enabled/disabled");
+        ret = -1;
+    }
+
+    pthread_mutex_unlock(&p_qap->lock);
+    DEBUG_MSG_VV("Exit");
+    return ret;
+}
+
+static int set_ms12_channel_mode_lock(int lock)
+{
+    int ret = 0;
+    int32_t cmd_data[2] = {0};
+    struct qap_module *qap_mod = &(p_qap->qap_mod[MS12]);
+
+    DEBUG_MSG_VV("%s:%d Entry", __func__, __LINE__);
+    if (p_qap) {
+       if (!p_qap->qap_mod[MS12].session_handle) {
+           p_qap->ms12_lock = p_qap->ms12_lock | lock << 1;
+           p_qap->ms12_lock = p_qap->ms12_lock | (1 << MS12_CHMOD_LOCK_MASK); //bit 2: save request for atmos_lock before session open
+           ERROR_MSG("request recieved but session is not setup, caching request");
+           return ret;
+       }
+    }
+
+    if (!(p_qap->ms12_lock & (1 << MS12_CHMOD_LOCK_MASK)))
+          pthread_mutex_lock(&p_qap->lock);
+
+    if (!p_qap->bypass_enable) {
+        cmd_data[0] = MS12_SESSION_CFG_CHMOD_LOCKING;
+        cmd_data[1] = lock;
+
+        check_and_activate_output_thread(true);
+        if (qap_mod->session_handle != NULL) {
+            ret = qap_session_cmd(qap_mod->session_handle,
+                  QAP_SESSION_CMD_SET_PARAM,
+                  sizeof(cmd_data),
+                  &cmd_data[0],
+                  NULL,
+                  NULL);
+           if (ret != QAP_STATUS_OK) {
+               ERROR_MSG("channel mode lock set failed");
+           }
+        } else {
+           DEBUG_MSG("qap module is not yet opened!! channel_mod_lock cannot be configured");
+        }
+        check_and_activate_output_thread(false);
+    } else {
+        ERROR_MSG("in bypass mode, channel mode lock can't be enabled/disabled");
+        ret = -1;
+    }
+    pthread_mutex_unlock(&p_qap->lock);
+    DEBUG_MSG_VV("Exit");
+    return ret;
+}
+
+static int qap_ms12_volume_easing_cmd(struct stream_out *out, float left, __unused float right, int32_t b_pause)
+{
+    int ret = 0;
+    struct qap_module *qap_mod = get_qap_module_for_input_stream_l(out);
+    int32_t cmd_data[4] = {0};
+
+    if (is_offload_usecase(out->usecase))
+        cmd_data[0] = MS12_SESSION_CFG_MAIN1_MIXING_GAIN;
+    else if ((out->usecase == USECASE_AUDIO_PLAYBACK_LOW_LATENCY) ||
+             (out->usecase == USECASE_AUDIO_PLAYBACK_DEEP_BUFFER)) {
+             DEBUG_MSG("Request for volume set for %s usecase not supported",
+                      (out->usecase == USECASE_AUDIO_PLAYBACK_LOW_LATENCY) ? "low_latency":"deepbuffer");
+             unlock_qap_stream_in(out);
+             return -ENOSYS;
+     }
+
+     /*take left as default level and MS12 doenst support left and right seperately*/
+     cmd_data[1] = AmpToDb(left);
+     if(!b_pause)
+        cmd_data[2] = property_get_int32("vendor.audio.qap.volumeramp.duration", 20); /* default duration 20ms */
+     else
+        cmd_data[2] = property_get_int32("vendor.audio.qap.pauseramp.duration", 20); /* default duration 20ms */
+     cmd_data[3] = qap_mod->interpolation; /* apply gain linearly*/
+
+     check_and_activate_output_thread(true);
+     if (qap_mod->session_handle != NULL) {
+         ret = qap_session_cmd(qap_mod->session_handle,
+                QAP_SESSION_CMD_SET_PARAM,
+                sizeof(cmd_data),
+                &cmd_data[0],
+                NULL,
+                NULL);
+          if (ret != QAP_STATUS_OK) {
+              ERROR_MSG("vol set failed");
+          }
+     } else
+        DEBUG_MSG("qap module is not yet opened!!, vol cannot be applied");
+     check_and_activate_output_thread(false);
+
+     return ret;
+}
+
 /*
 * get the MS12 o/p stream and update the volume
 */
@@ -646,41 +790,14 @@ static int qap_set_stream_volume(struct audio_stream_out *stream, float left, fl
     int ret = 0;
     struct stream_out *out = (struct stream_out *)stream;
     struct qap_module *qap_mod = get_qap_module_for_input_stream_l(out);
-    int32_t cmd_data[4] = {0};
 
     DEBUG_MSG("Left %f, Right %f", left, right);
 
     lock_qap_stream_in(out);
     if (!p_qap->bypass_enable) {
-        if (is_offload_usecase(out->usecase))
-            cmd_data[0] = MS12_SESSION_CFG_SYSSOUND_MIXING_GAIN_INPUT1;
-        else if ((out->usecase == USECASE_AUDIO_PLAYBACK_LOW_LATENCY) ||
-            (out->usecase == USECASE_AUDIO_PLAYBACK_DEEP_BUFFER)) {
-            DEBUG_MSG("Request for volume set for %s usecase not supported",
-                      (out->usecase == USECASE_AUDIO_PLAYBACK_LOW_LATENCY) ? "low_latency":"deepbuffer");
-             unlock_qap_stream_in(out);
-             return -ENOSYS;
-        }
-
-        /*take left as default level and MS12 doenst support left and right seperately*/
-        cmd_data[1] = AmpToDb(left);
-        cmd_data[2] = 0;/* apply gain instantly*/
-        cmd_data[3] = 0;/* apply gain linearly*/
-
-        check_and_activate_output_thread(true);
-        if (qap_mod->session_handle != NULL) {
-           ret = qap_session_cmd(qap_mod->session_handle,
-                  QAP_SESSION_CMD_SET_PARAM,
-                  sizeof(cmd_data),
-                  &cmd_data[0],
-                  NULL,
-                  NULL);
-           if (ret != QAP_STATUS_OK) {
-              ERROR_MSG("vol set failed");
-           }
-        } else
-           DEBUG_MSG("qap module is not yet opened!!, vol cannot be applied");
-        check_and_activate_output_thread(false);
+        qap_ms12_volume_easing_cmd(out, left, right, 0);
+        if (!qap_mod->pause)
+             qap_mod->vol_left = left;
     } else {
         ret = p_qap->hal_stream_ops.set_volume(stream, left, right);
     }
@@ -892,6 +1009,7 @@ static int qap_stream_pause_l(struct stream_out *out)
 {
     struct qap_module *qap_mod = NULL;
     int ret = -EINVAL;
+    float left = 0.0f;
 
     qap_mod = get_qap_module_for_input_stream_l(out);
     if (!qap_mod || !qap_mod->session_handle|| !out->qap_stream_handle) {
@@ -900,6 +1018,9 @@ static int qap_stream_pause_l(struct stream_out *out)
         return -EINVAL;
     }
 
+    qap_ms12_volume_easing_cmd(out, left, left, 1);
+
+    check_and_activate_output_thread(true);
     ret = qap_module_cmd(out->qap_stream_handle,
                             QAP_MODULE_CMD_PAUSE,
                             sizeof(QAP_MODULE_CMD_PAUSE),
@@ -910,6 +1031,8 @@ static int qap_stream_pause_l(struct stream_out *out)
         ERROR_MSG("pause failed %d", ret);
         return -EINVAL;
     }
+    qap_mod->pause = true;
+    check_and_activate_output_thread(false);
 
     return ret;
 }
@@ -1049,7 +1172,9 @@ static int qap_out_standby(struct audio_stream *stream)
               qap_session callback acquires lock and moves stream
               to stopped state.
              */
+             p_qap->wait_on_cond = 1;
              pthread_cond_wait(&qap_mod->drain_output_cond, &out->lock);
+             p_qap->wait_on_cond = 0;
           } while(1);
        }
 
@@ -1064,7 +1189,8 @@ static int qap_out_standby(struct audio_stream *stream)
                DEBUG_MSG("[%s] stream is still active.", use_case_table[qap_mod->stream_in[i]->usecase]);
            } else {
                lock_session_output(qap_mod);
-               qap_mod->is_session_output_active = false;
+               if (!p_qap->wait_on_cond)
+                   qap_mod->is_session_output_active = false;
                unlock_session_output(qap_mod);
                DEBUG_MSG(" all the input streams are either closed or stopped(standby) block the MM module output");
            }
@@ -1816,6 +1942,8 @@ static void qap_session_callback(qap_session_handle_t session_handle __unused,
                 config.format = config.offload_info.format = AUDIO_FORMAT_PCM_16_BIT;
                 config.offload_info.bit_width = CODEC_BACKEND_DEFAULT_BIT_WIDTH;
                 config.offload_info.channel_mask = config.channel_mask = AUDIO_CHANNEL_OUT_STEREO;
+                if (qap_check_and_get_compressed_device_format(device, &format))
+                    config.offload_info.channel_mask = config.channel_mask = AUDIO_CHANNEL_OUT_5POINT1;
 
                 need_to_recreate_stream = false;
                 index = get_media_fmt_array_index_for_output_id_l(qap_mod, device);
@@ -1944,7 +2072,6 @@ static void qap_session_callback(qap_session_handle_t session_handle __unused,
                     audio_devices_t devices;
 
                     config.format = config.offload_info.format = format;
-                    config.offload_info.channel_mask = config.channel_mask = AUDIO_CHANNEL_OUT_5POINT1;
 
                     flags = (AUDIO_OUTPUT_FLAG_NON_BLOCKING
                              | AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD
@@ -2534,6 +2661,11 @@ static int qap_set_hdmi_configuration_to_module()
                 }
                 passth_support = true;
             }
+
+            if ((p_qap->ms12_lock & (1 << MS12_CHMOD_LOCK_MASK))) {
+                if (!set_ms12_channel_mode_lock(((int)p_qap->ms12_lock)))
+                    p_qap->ms12_lock = (p_qap->ms12_lock & (~(1 << MS12_CHMOD_LOCK_MASK)));
+            }
         }
 
         if (p_qap->qap_mod[DTS_M8].session_handle) {
@@ -2556,6 +2688,14 @@ static int qap_set_hdmi_configuration_to_module()
             }
         }
     }
+
+    //Check for atmos lock request
+    if ((p_qap->ms12_lock & (1 << MS12_ATMOS_LOCK_MASK))) {
+        if (!set_ms12_atmos_lock((int)p_qap->ms12_lock))
+            //on success clear atmos lock request bit.
+            p_qap->ms12_lock = (p_qap->ms12_lock & (~(1 << MS12_ATMOS_LOCK_MASK)));
+    }
+
     //Compressed passthrough is not enabled.
     if (!passth_support) {
 
@@ -3105,6 +3245,7 @@ static int qap_out_resume(struct audio_stream_out* stream)
 {
     struct stream_out *out = (struct stream_out *)stream;
     int status = 0;
+    struct qap_module *qap_mod = get_qap_module_for_input_stream_l(out);;
     DEBUG_MSG("Output Stream %p", out);
 
     lock_qap_stream_in(out);
@@ -3122,6 +3263,7 @@ static int qap_out_resume(struct audio_stream_out* stream)
           }
           pthread_mutex_unlock(&p_qap->lock);
        } else {
+          qap_mod->pause = true;
           //Flush the module input stream.
           status = qap_stream_start_l(out);
        }
@@ -3513,6 +3655,56 @@ int audio_extn_qap_set_parameters(struct audio_device *adev, struct str_parms *p
         //TODO else if: Need to consider other devices.
     }
 
+    status = str_parms_get_int(parms, "ms12_atmos_lock", &val);
+    if (status >= 0) {
+        if (val)
+            p_qap->ms12_lock = p_qap->ms12_lock | val;
+        else
+            p_qap->ms12_lock = (p_qap->ms12_lock & (~1));
+        p_qap->ms12_lock = (p_qap->ms12_lock | (1 << MS12_ATMOS_LOCK_MASK));
+
+        status = set_ms12_atmos_lock(val);
+        if (!status) {
+            //on success clear atmos lock request bit.
+            p_qap->ms12_lock = (p_qap->ms12_lock & (~(1 << MS12_ATMOS_LOCK_MASK)));
+        }
+        DEBUG_MSG("Set ms12_atmos_lock to %d:%d is %s", val, p_qap->ms12_lock, status ? "failed" : "success");
+        return status;
+    }
+
+    status = str_parms_get_int(parms, "ms12_chmod_lock", &val);
+    if (status >= 0) {
+        if (val)
+            p_qap->ms12_lock = (p_qap->ms12_lock | (~0 & (val << 1))); //set
+        else
+            p_qap->ms12_lock = (p_qap->ms12_lock & (~(1 << 1))); //reset
+        p_qap->ms12_lock = (p_qap->ms12_lock | (1 << MS12_CHMOD_LOCK_MASK));
+
+        status = set_ms12_channel_mode_lock(val);
+        if (!status)
+            p_qap->ms12_lock = (p_qap->ms12_lock & (~(1 << MS12_CHMOD_LOCK_MASK)));
+        DEBUG_MSG("Set ms12 channel_mode_lock to %d:%d is %s", val, p_qap->ms12_lock, status ? "failed" : "success");
+        return status;
+    }
+
+    status = str_parms_get_int(parms, "ms12_volume_interpolation", &val);
+    if (status >= 0) {
+        pthread_mutex_lock(&p_qap->lock);
+        p_qap->qap_mod[MS12].interpolation = val;
+        pthread_mutex_unlock(&p_qap->lock);
+        DEBUG_MSG("Set ms12 volume interpolation %d is %s", val, status ? "failed" : "success");
+        return status;
+    }
+
+    status = str_parms_get_int(parms, "ms12_continuous_output", &val);
+    if (status >= 0) {
+        pthread_mutex_lock(&p_qap->lock);
+        p_qap->qap_output_block_handling = val? 0 : 1;
+        pthread_mutex_unlock(&p_qap->lock);
+        DEBUG_MSG("Set ms12 continuous_output to %d is %s", val, status ? "failed" : "success");
+        return status;
+    }
+
     DEBUG_MSG("Exit");
     return status;
 }
@@ -3570,6 +3762,17 @@ int audio_extn_qap_init(struct audio_device *adev)
                 pthread_cond_init(&qap_mod->session_output_cond, (const pthread_condattr_t *)NULL);
                 pthread_cond_init(&qap_mod->drain_output_cond, (const pthread_condattr_t *)NULL);
             }
+            //bit 0:atmos lock will be disabled by default
+            p_qap->ms12_lock = p_qap->ms12_lock & (~1);
+            //bit 2:reset atmos lock request bit
+            p_qap->ms12_lock = (p_qap->ms12_lock & (~(1 << MS12_ATMOS_LOCK_MASK)));
+            //default chmod_lock is enabled
+            p_qap->ms12_lock = p_qap->ms12_lock | (1 << 1);
+            p_qap->qap_output_block_handling = 0;
+
+            qap_mod->interpolation = 0; /*apply gain linearly*/
+            qap_mod->pause = false;
+            p_qap->wait_on_cond = 0;
         } else if (i == DTS_M8) {
             property_get("vendor.audio.qap.m8.library", value, NULL);
             if (value[0] != 0) {
